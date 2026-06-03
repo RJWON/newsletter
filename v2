@@ -1,0 +1,537 @@
+// @ts-nocheck
+// ==========================================
+// 0. 상수 정의
+// ==========================================
+const NEWS_SHEET_NAME = "설정";
+const GEMINI_API_SHEET_NAME = "Gemini API 설정";
+
+// Gemini API 설정
+const GEMINI_MODEL = "gemini-1.5-flash-latest";
+const GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models/";
+
+// 중요도 레이블
+const IMPORTANCE = {
+  HIGH:   { stars: "★★★", score: 3 },
+  MEDIUM: { stars: "★★",  score: 2 },
+  LOW:    { stars: "★",   score: 1 },
+};
+
+// ==========================================
+// 1. 메뉴 생성
+// ==========================================
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("🟢 뉴스 요약 실행")
+    .addItem("📧 이메일 발송하기", "sendWeeklyNewsEmail")
+    .addToUi();
+}
+
+// ==========================================
+// 2. 메인 실행 함수
+// ==========================================
+function sendWeeklyNewsEmail() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // ── 설정 값 불러오기 ──────────────────────────
+  const keywordCombos      = getKeywordCombos(ss, NEWS_SHEET_NAME);
+  const recipientsRaw      = getSettingValue(ss, NEWS_SHEET_NAME, "메일 수신자");
+  const recipients         = recipientsRaw
+    ? recipientsRaw.split(",").map(r => r.trim()).filter(Boolean)
+    : [];
+  const searchDaysVal      = getSettingValue(ss, NEWS_SHEET_NAME, "검색 기간");
+  const searchDays         = searchDaysVal ? parseInt(searchDaysVal) : 1;
+
+  // ── API Key 불러오기 (Gemini + Naver) ──────────
+  const geminiApiKey       = getSettingValue(ss, GEMINI_API_SHEET_NAME, "Gemini API Key");
+  const naverClientId      = getSettingValue(ss, GEMINI_API_SHEET_NAME, "Naver Client ID");
+  const naverClientSecret  = getSettingValue(ss, GEMINI_API_SHEET_NAME, "Naver Client Secret");
+
+  // ── 언론사 필터 ────────────────────────────────
+  const allowedPublishersRaw = getSettingValue(ss, NEWS_SHEET_NAME, "필터링할 언론사 (쉼표로 구분)");
+  const allowedPublishers    = allowedPublishersRaw
+    ? allowedPublishersRaw.split(",").map(p => p.trim()).filter(Boolean)
+    : [];
+
+  // ── 필수 값 검증 ───────────────────────────────
+  if (!geminiApiKey)          { alert_("Gemini API Key가 누락되었습니다."); return; }
+  if (!naverClientId || !naverClientSecret) { alert_("네이버 Client ID/Secret이 누락되었습니다."); return; }
+  if (keywordCombos.length === 0)           { alert_("검색 키워드가 설정되지 않았습니다."); return; }
+
+  // ==========================================
+  // Step 1. 키워드별 뉴스 수집
+  // ==========================================
+  const MAX_PER_KEYWORD = 6;
+  let allNews = []; // { keyword, headline, link, summary, thumbnail, publisher, stars, score }
+
+  for (const combo of keywordCombos) {
+    const mainKeyword = combo.mainKeyword;
+    Logger.log(`[수집] "${mainKeyword}" 검색 중...`);
+
+    let articles = searchNaverNewsAPI(mainKeyword, searchDays, 100, naverClientId, naverClientSecret);
+
+    // 언론사 필터
+    if (allowedPublishers.length > 0) {
+      articles = articles.filter(a => allowedPublishers.includes(a.publisher));
+    }
+
+    // ── Step 2. 의미 기반 중복 제거 (LLM 활용) ──
+    articles = semanticDeduplication(articles, geminiApiKey);
+
+    // 상위 N개만
+    articles = articles.slice(0, MAX_PER_KEYWORD);
+
+    if (articles.length === 0) continue;
+
+    // ── Step 3. 중요도 판별 (LLM 배치 호출) ──────
+    const scoredArticles = batchScoreImportance(articles, geminiApiKey);
+
+    for (const a of scoredArticles) {
+      allNews.push({
+        keyword:   mainKeyword,
+        headline:  a.headline,
+        link:      a.link,
+        summary:   a.description,
+        thumbnail: a.thumbnail,
+        publisher: a.publisher,
+        stars:     a.stars,
+        score:     a.score,
+      });
+    }
+
+    Logger.log(`[완료] "${mainKeyword}" - ${scoredArticles.length}개 처리`);
+    Utilities.sleep(500); // 키워드 간 간격
+  }
+
+  if (allNews.length === 0) {
+    alert_("새로운 뉴스가 없습니다.");
+    return;
+  }
+
+  // ── Step 4. Executive Summary 생성 ────────────
+  const executiveSummary = generateExecutiveSummary(allNews, searchDays, geminiApiKey);
+
+  // ── Step 5. 이메일 구성 및 발송 ───────────────
+  const subject   = `[Sleep상품기획팀] 주간 뉴스 요약 (${new Date().toLocaleDateString("ko-KR")})`;
+  const emailBody = composeEmailContent(allNews, searchDays, executiveSummary);
+
+  if (recipients.length === 0) { alert_("메일 수신자가 설정되지 않았습니다."); return; }
+
+  for (const recipient of recipients) {
+    MailApp.sendEmail({ to: recipient, subject: subject, htmlBody: emailBody });
+  }
+  Browser.msgBox("성공", "뉴스 요약 메일 발송이 완료되었습니다.", Browser.Buttons.OK);
+}
+
+// ==========================================
+// 3. [신규] 의미 기반 중복 제거 (LLM 배치)
+// ==========================================
+/**
+ * LLM에게 기사 목록을 한 번에 보내 의미상 중복인 기사의 인덱스를 식별하게 합니다.
+ * LLM 호출 실패 시 기존 단순 문자열 비교 방식으로 폴백합니다.
+ *
+ * @param {Array} articles - 원본 기사 배열
+ * @param {string} geminiApiKey
+ * @returns {Array} 중복 제거된 기사 배열
+ */
+function semanticDeduplication(articles, geminiApiKey) {
+  if (articles.length <= 1) return articles;
+
+  // 1차: 단순 URL/제목 완전 일치 제거 (빠른 사전 처리)
+  const seen = new Set();
+  let candidates = [];
+  for (const a of articles) {
+    const key = a.link + "||" + a.headline.slice(0, 20);
+    if (!seen.has(key)) {
+      seen.add(key);
+      candidates.push(a);
+    }
+  }
+  if (candidates.length <= 1) return candidates;
+
+  // 2차: LLM 의미 분석
+  const titlesJson = candidates.map((a, i) => `${i}: ${a.headline}`).join("\n");
+
+  const prompt = `아래는 뉴스 기사 제목 목록입니다(인덱스: 제목 형식).
+제목이 달라도 실질적으로 동일한 사건/보도자료를 다루는 중복 기사를 찾아주세요.
+중복 그룹이 있을 경우, 각 그룹에서 인덱스가 가장 작은 기사만 남기고
+나머지 인덱스를 "제거 대상"으로 반환하세요.
+
+기사 목록:
+${titlesJson}
+
+반드시 아래 JSON 형식으로만 답변하세요. 다른 텍스트는 절대 포함하지 마세요.
+{"remove": [제거할 인덱스 배열]}
+
+중복이 없으면: {"remove": []}`;
+
+  try {
+    const result = callGeminiJSON(prompt, geminiApiKey);
+    if (result && Array.isArray(result.remove)) {
+      const removeSet = new Set(result.remove);
+      Logger.log(`[중복제거] 제거 인덱스: ${JSON.stringify([...removeSet])}`);
+      return candidates.filter((_, i) => !removeSet.has(i));
+    }
+  } catch (e) {
+    Logger.log(`[중복제거] LLM 오류, 폴백 적용: ${e.message}`);
+  }
+
+  // 폴백: 기존 단순 비교
+  return filterDuplicateNews(candidates);
+}
+
+// ==========================================
+// 4. [신규] 중요도 배치 판별 (LLM 단일 호출)
+// ==========================================
+/**
+ * 기사 배열 전체를 한 번의 LLM 호출로 중요도 판별합니다.
+ * 실패 시 모든 기사에 ★(LOW) 부여.
+ *
+ * @param {Array} articles
+ * @param {string} geminiApiKey
+ * @returns {Array} stars, score 속성이 추가된 기사 배열
+ */
+function batchScoreImportance(articles, geminiApiKey) {
+  const articlesJson = articles.map((a, i) => ({
+    index: i,
+    title: a.headline,
+    snippet: (a.description || "").slice(0, 120),
+  }));
+
+  const prompt = `당신은 가구/침대/수면 업계 뉴스 중요도 분류 전문가입니다.
+아래 기사 목록의 각 항목에 대해 중요도 등급을 판별해 주세요.
+
+판별 기준:
+- 3: 신제품 출시, 시장 규모, 매출과 관련된 뉴스
+- 2: 가격 인상, 프로모션, 가구업계 동향과 관련된 뉴스
+- 1: 위 기준에 해당하지 않는 기타 일반 뉴스
+
+기사 목록(JSON):
+${JSON.stringify(articlesJson)}
+
+반드시 아래 JSON 형식으로만 답변하세요. 다른 텍스트는 절대 포함하지 마세요.
+{"scores": [{"index": 0, "grade": 3}, {"index": 1, "grade": 1}, ...]}`;
+
+  let scoreMap = {}; // index -> grade
+
+  try {
+    const result = callGeminiJSON(prompt, geminiApiKey);
+    if (result && Array.isArray(result.scores)) {
+      for (const s of result.scores) {
+        scoreMap[s.index] = s.grade;
+      }
+    }
+  } catch (e) {
+    Logger.log(`[중요도] LLM 오류, 전체 ★ 적용: ${e.message}`);
+  }
+
+  return articles.map((a, i) => {
+    const grade = scoreMap[i] || 1;
+    const imp   = grade === 3 ? IMPORTANCE.HIGH : grade === 2 ? IMPORTANCE.MEDIUM : IMPORTANCE.LOW;
+    return { ...a, stars: imp.stars, score: imp.score };
+  });
+}
+
+// ==========================================
+// 5. [신규] Executive Summary 생성
+// ==========================================
+/**
+ * ★★★, ★★ 기사들을 바탕으로 전체 동향 요약(3~4줄) 생성.
+ *
+ * @param {Array} allNews
+ * @param {number} searchDays
+ * @param {string} geminiApiKey
+ * @returns {string} HTML 형식의 요약 텍스트
+ */
+function generateExecutiveSummary(allNews, searchDays, geminiApiKey) {
+  const keyArticles = allNews.filter(n => n.score >= 2);
+  if (keyArticles.length === 0) {
+    return "<p>이번 기간 주요 뉴스가 없습니다.</p>";
+  }
+
+  const keyTitles = keyArticles
+    .map(n => `[${n.keyword}] ${n.stars} ${n.headline}`)
+    .join("\n");
+
+  const prompt = `당신은 가구/침대/수면 업계 전문 애널리스트입니다.
+아래는 최근 ${searchDays}일간 수집된 중요 뉴스 목록입니다.
+
+${keyTitles}
+
+위 뉴스를 바탕으로 업계 전반의 동향을 3~4문장으로 간결하게 요약해 주세요.
+- 한국어로 작성
+- 전문적이고 객관적인 어조 유지
+- 핵심 트렌드와 시사점 중심으로 서술
+- 마크다운이나 특수기호 없이 순수 텍스트만 반환`;
+
+  try {
+    const raw = callGeminiText(prompt, geminiApiKey);
+    if (raw) {
+      return raw.split("\n").filter(Boolean).map(line => `<p>${line}</p>`).join("");
+    }
+  } catch (e) {
+    Logger.log(`[요약] Executive Summary 생성 실패: ${e.message}`);
+  }
+  return "<p>핵심 뉴스 요약을 생성하지 못했습니다.</p>";
+}
+
+// ==========================================
+// 6. [수정] 이메일 HTML 구성
+// ==========================================
+/**
+ * 이메일 본문을 구성합니다.
+ * - 최상단: Executive Summary
+ * - 키워드별 섹션: 중요도 내림차순(★★★ → ★★ → ★) 정렬
+ *
+ * @param {Array}  allNews          - 뉴스 객체 배열 (stars, score 포함)
+ * @param {number} searchDays
+ * @param {string} executiveSummary - HTML 형식 요약문
+ * @returns {string} HTML 이메일 본문
+ */
+function composeEmailContent(allNews, searchDays, executiveSummary) {
+  const today    = new Date().toLocaleDateString("ko-KR");
+  const fromDate = new Date();
+  fromDate.setDate(fromDate.getDate() - searchDays);
+  const fromStr  = fromDate.toLocaleDateString("ko-KR");
+
+  // 키워드별 그룹핑
+  const grouped = {};
+  for (const news of allNews) {
+    if (!grouped[news.keyword]) grouped[news.keyword] = [];
+    grouped[news.keyword].push(news);
+  }
+
+  // 각 키워드 내 중요도 내림차순 정렬
+  for (const kw of Object.keys(grouped)) {
+    grouped[kw].sort((a, b) => (b.score || 1) - (a.score || 1));
+  }
+
+  // ── 별점 색상 헬퍼 ──────────────────────────────
+  const starsHtml = (stars) => {
+    const color = stars === "★★★" ? "#E8221A"
+                : stars === "★★"  ? "#FF8C00"
+                :                   "#888888";
+    return `<span style="color:${color};font-weight:bold;font-size:15px;letter-spacing:1px;">${stars}</span>`;
+  };
+
+  // ── HTML 조립 ────────────────────────────────────
+  let html = `
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<style>
+  body { font-family: "Apple SD Gothic Neo", "맑은 고딕", sans-serif; background:#f5f5f5; color:#222; margin:0; padding:0; }
+  .wrap { max-width:700px; margin:24px auto; background:#fff; border-radius:12px; overflow:hidden; box-shadow:0 2px 12px rgba(0,0,0,.1); }
+  .header { background:linear-gradient(135deg,#1a3a5c,#2e6da4); color:#fff; padding:28px 32px; }
+  .header h1 { margin:0 0 6px; font-size:20px; }
+  .header p  { margin:0; font-size:13px; opacity:.8; }
+  .section-exec { background:#fffbf0; border-left:5px solid #f0a500; padding:20px 28px; margin:0; }
+  .section-exec h2 { font-size:15px; color:#b07800; margin:0 0 10px; display:flex; align-items:center; gap:6px; }
+  .section-exec p  { margin:5px 0; font-size:14px; line-height:1.7; color:#444; }
+  .kw-section  { padding:20px 28px; border-bottom:1px solid #eee; }
+  .kw-title    { font-size:16px; font-weight:700; color:#1a3a5c; margin:0 0 14px; border-left:4px solid #2e6da4; padding-left:10px; }
+  .card        { display:flex; gap:14px; margin-bottom:16px; padding:14px; border-radius:8px; border:1px solid #e8e8e8; background:#fafafa; }
+  .card:last-child { margin-bottom:0; }
+  .card.high   { border-left:4px solid #E8221A; background:#fff9f9; }
+  .card.medium { border-left:4px solid #FF8C00; background:#fffdf5; }
+  .card.low    { border-left:4px solid #ccc; }
+  .thumb       { flex-shrink:0; width:90px; height:68px; object-fit:cover; border-radius:6px; }
+  .card-body   { flex:1; min-width:0; }
+  .card-meta   { font-size:11px; color:#888; margin-bottom:4px; }
+  .card-title  { font-size:14px; font-weight:700; margin:0 0 6px; line-height:1.4; }
+  .card-title a { color:#1a3a5c; text-decoration:none; }
+  .card-title a:hover { text-decoration:underline; }
+  .card-summary { font-size:12px; color:#555; line-height:1.6; margin:0; }
+  .footer      { text-align:center; padding:16px; font-size:11px; color:#aaa; background:#f9f9f9; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- 헤더 -->
+  <div class="header">
+    <h1>📰 Sleep상품기획팀 주간 뉴스 요약</h1>
+    <p>${fromStr} ~ ${today} | 검색 기간: ${searchDays}일</p>
+  </div>
+
+  <!-- Executive Summary -->
+  <div class="section-exec">
+    <h2>📊 주간 핵심 뉴스 요약 (Executive Summary)</h2>
+    ${executiveSummary}
+  </div>
+`;
+
+  // 키워드 섹션
+  for (const [kw, articles] of Object.entries(grouped)) {
+    html += `<div class="kw-section"><p class="kw-title">🔍 ${escapeHtml(kw)}</p>`;
+
+    for (const a of articles) {
+      const cardClass = a.score === 3 ? "high" : a.score === 2 ? "medium" : "low";
+      // 썸네일이 있을 때만 이미지 렌더링, 없으면 아무것도 출력하지 않음
+      const thumbHtml = a.thumbnail
+        ? `<img class="thumb" src="${a.thumbnail}" alt="썸네일" onerror="this.style.display='none'">`
+        : ``;
+
+      html += `
+      <div class="card ${cardClass}">
+        ${thumbHtml}
+        <div class="card-body">
+          <div class="card-meta">${starsHtml(a.stars)} &nbsp;|&nbsp; ${escapeHtml(a.publisher)}</div>
+          <p class="card-title"><a href="${a.link}" target="_blank">${escapeHtml(a.headline)}</a></p>
+          <p class="card-summary">${escapeHtml(a.summary || "")}</p>
+        </div>
+      </div>`;
+    }
+
+    html += `</div>`;
+  }
+
+  html += `
+  <div class="footer">본 메일은 자동 발송되었습니다. &copy; Sleep상품기획팀</div>
+</div>
+</body>
+</html>`;
+
+  return html;
+}
+
+// ==========================================
+// 7. Gemini API 호출 유틸리티
+// ==========================================
+
+/**
+ * Gemini에 텍스트 프롬프트를 보내고 JSON 객체를 파싱하여 반환합니다.
+ * 실패 시 예외를 throw합니다.
+ */
+function callGeminiJSON(prompt, apiKey) {
+  const raw = callGeminiText(prompt, apiKey);
+  // 코드블록 펜스 제거
+  const cleaned = raw.replace(/```json|```/gi, "").trim();
+  return JSON.parse(cleaned);
+}
+
+/**
+ * Gemini에 텍스트 프롬프트를 보내고 응답 텍스트를 반환합니다.
+ */
+function callGeminiText(prompt, apiKey) {
+  const url  = `${GEMINI_API_BASE_URL}${GEMINI_MODEL}:generateContent?key=${apiKey}`;
+  const body = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: { temperature: 0.1, maxOutputTokens: 1024 },
+  };
+  const options = {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(body),
+    muteHttpExceptions: true,
+  };
+
+  const resp = UrlFetchApp.fetch(url, options);
+  if (resp.getResponseCode() !== 200) {
+    throw new Error(`Gemini API HTTP ${resp.getResponseCode()}: ${resp.getContentText().slice(0, 200)}`);
+  }
+  const json = JSON.parse(resp.getContentText());
+  const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) throw new Error("Gemini 응답에 텍스트가 없습니다.");
+  return text.trim();
+}
+
+// ==========================================
+// 8. 기존 헬퍼 함수 (유지)
+// ==========================================
+
+function getSettingValue(ss, sheetName, itemName) {
+  const sheet = ss.getSheetByName(sheetName);
+  if (!sheet) return "";
+  const data = sheet.getDataRange().getValues();
+  for (const row of data) {
+    if (row[0] === itemName) return row[1] != null ? row[1].toString().trim() : "";
+  }
+  return "";
+}
+
+function getKeywordCombos(ss, sheetName) {
+  const sheet = ss.getSheetByName(sheetName);
+  if (!sheet) return [];
+  const data = sheet.getDataRange().getValues();
+  if (data.length < 2) return [];
+  const header  = data[0];
+  const mainIdx = header.indexOf("메인 키워드");
+  const subIdx  = header.indexOf("보조 키워드 (OR)");
+  if (mainIdx === -1) return [];
+  const combos = [];
+  for (let i = 1; i < data.length; i++) {
+    const mainKw = (data[i][mainIdx] || "").toString().trim();
+    if (!mainKw) continue;
+    const subKwStr = (subIdx !== -1 ? data[i][subIdx] : "").toString().trim();
+    const subKws   = subKwStr.split(",").map(k => k.trim()).filter(Boolean);
+    combos.push({ mainKeyword: mainKw, subKeywords: subKws });
+  }
+  return combos;
+}
+
+function searchNaverNewsAPI(keyword, days, limit, clientId, clientSecret) {
+  const encodedKw = encodeURIComponent(keyword);
+  const apiUrl    = `https://openapi.naver.com/v1/search/news.json?query=${encodedKw}&display=${limit}&sort=sim`;
+  try {
+    const resp = UrlFetchApp.fetch(apiUrl, {
+      method: "get",
+      headers: { "X-Naver-Client-Id": clientId, "X-Naver-Client-Secret": clientSecret },
+      muteHttpExceptions: true,
+    });
+    if (resp.getResponseCode() !== 200) return [];
+    const json = JSON.parse(resp.getContentText());
+    if (!json.items?.length) return [];
+
+    const cleanText = (t) => !t ? "" : t
+      .replace(/<[^>]+>/g, "")
+      .replace(/&quot;/g, '"').replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&nbsp;/g, " ");
+
+    const threshold = new Date();
+    threshold.setHours(0, 0, 0, 0);
+    threshold.setDate(threshold.getDate() - days);
+
+    const articles = [];
+    for (const item of json.items) {
+      const pubDate = new Date(item.pubDate);
+      pubDate.setHours(0, 0, 0, 0);
+      if (pubDate < threshold) continue;
+      articles.push({
+        headline:    cleanText(item.title),
+        link:        item.link,
+        description: cleanText(item.description),
+        pubDate:     pubDate,
+        thumbnail:   item.thumbnail || null,
+        publisher:   item.publisher || "알 수 없음",
+      });
+      if (articles.length >= limit) break;
+    }
+    return articles;
+  } catch (e) {
+    Logger.log(`[네이버API 오류] ${e.message}`);
+    return [];
+  }
+}
+
+/** 기존 단순 중복 제거 (LLM 폴백용으로 유지) */
+function filterDuplicateNews(articles) {
+  const seen = new Set();
+  return articles.filter(a => {
+    const key = a.headline.replace(/\s+/g, "").slice(0, 25);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function escapeHtml(text) {
+  if (!text) return "";
+  return text.toString()
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function alert_(msg) {
+  Browser.msgBox("알림", msg, Browser.Buttons.OK);
+}
